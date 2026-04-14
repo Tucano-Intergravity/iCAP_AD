@@ -80,7 +80,6 @@ static volatile uint8_t imu_rx_restart_request = 0U;
 static volatile uint32_t imu_rx_start_fail_count = 0U;
 static volatile uint32_t imu_packet_count = 0U;
 static volatile uint32_t imu_packet_error_count = 0U;
-static volatile uint8_t imu_nav_ready = 0U;
 static IMU_Data_t imu_last_data;
 static volatile uint16_t imu_dma_current_pos_dbg = 0U;
 static volatile uint32_t imu_dma_bytes_total = 0U;
@@ -108,9 +107,12 @@ static void MX_UART4_Init(void);
 
 static void UART7_StartReceiveIT(void);
 static void UART7_SendAtCommandIT(void);
+static void IMU_Init(void);
+static bool IMU_PollNewData(IMU_Data_t *out_data);
 static void IMU_ResetPacketState(void);
 static void IMU_ProcessDmaBuffer(void);
 static void IMU_StartReceiveDMA(void);
+static void IMU_ServiceRecovery(void);
 static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length);
 
 /* USER CODE END PFP */
@@ -142,6 +144,45 @@ static void UART7_SendAtCommandIT(void)
 static void IMU_ResetPacketState(void)
 {
   /* Reserved for future parser state reset. */
+}
+
+static bool IMU_PollNewData(IMU_Data_t *out_data)
+{
+  static uint32_t last_consumed_packet_count = 0U;
+  bool has_new_data = false;
+
+  /* Single IMU service entry point for main loop:
+   * 1) drain DMA buffer
+   * 2) recover stalled RX path
+   * 3) expose newly parsed NAV data */
+  IMU_ProcessDmaBuffer();
+  IMU_ServiceRecovery();
+
+  __disable_irq();
+  if (imu_packet_count != last_consumed_packet_count)
+  {
+    last_consumed_packet_count = imu_packet_count;
+    if (out_data != NULL)
+    {
+      *out_data = imu_last_data;
+    }
+    has_new_data = true;
+  }
+  __enable_irq();
+
+  return has_new_data;
+}
+
+static void IMU_Init(void)
+{
+  IMU_ResetPacketState();
+  imu_dma_last_pos = 0U;
+  imu_last_rx_tick = HAL_GetTick();
+  imu_last_progress_tick = imu_last_rx_tick;
+  imu_dma_prev_pos_dbg = 0U;
+  /* Match reference project behavior: keep overrun detection enabled. */
+  CLEAR_BIT(huart4.Instance->CR3, USART_CR3_OVRDIS);
+  IMU_StartReceiveDMA();
 }
 
 static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length)
@@ -232,7 +273,6 @@ static void IMU_ProcessDmaBuffer(void)
           {
             imu_last_data.timestamp = HAL_GetTick();
             imu_packet_count++;
-            imu_nav_ready = 1U;
             imu_last_rx_tick = HAL_GetTick();
             imu_dma_bytes_total += IMU_PACKET_SIZE;
             imu_dma_last_pos = (uint16_t)((pos + IMU_PACKET_SIZE) % IMU_DMA_BUFFER_SIZE);
@@ -312,6 +352,25 @@ static void IMU_StartReceiveDMA(void)
   }
 }
 
+static void IMU_ServiceRecovery(void)
+{
+  if (imu_rx_restart_request != 0U)
+  {
+    imu_rx_restart_request = 0U;
+    IMU_StartReceiveDMA();
+  }
+
+  if ((huart4.hdmarx != NULL) &&
+      ((HAL_GetTick() - imu_last_progress_tick) > 100U) &&
+      (imu_rx_restart_request == 0U))
+  {
+    /* Recover from silent UART4 DMA stalls with no HAL error callback. */
+    HAL_UART_DMAStop(&huart4);
+    imu_stall_restart_count++;
+    IMU_StartReceiveDMA();
+  }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -385,14 +444,7 @@ if ( timeout < 0 )
   MX_UART7_Init();
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
-  IMU_ResetPacketState();
-  imu_dma_last_pos = 0U;
-  imu_last_rx_tick = HAL_GetTick();
-  imu_last_progress_tick = imu_last_rx_tick;
-  imu_dma_prev_pos_dbg = 0U;
-  /* Match reference project behavior: keep overrun detection enabled. */
-  CLEAR_BIT(huart4.Instance->CR3, USART_CR3_OVRDIS);
-  IMU_StartReceiveDMA();
+  IMU_Init();
 
   /* IRIDIUM 9603 power control: PF10 = HIGH */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
@@ -417,10 +469,16 @@ if ( timeout < 0 )
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    IMU_Data_t imu_data;
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    IMU_ProcessDmaBuffer();
+    if (IMU_PollNewData(&imu_data))
+    {
+      /* New NAV data received: use imu_data here. */
+      (void)imu_data;
+    }
 
 #if IRIDIUM_TEST_ENABLE
     if ((HAL_GetTick() - uart7_last_tx_tick) >= 1000U)
@@ -442,21 +500,6 @@ if ( timeout < 0 )
     }
 #endif
 
-    if (imu_rx_restart_request != 0U)
-    {
-      imu_rx_restart_request = 0U;
-      IMU_StartReceiveDMA();
-    }
-
-    if ((huart4.hdmarx != NULL) &&
-        ((HAL_GetTick() - imu_last_progress_tick) > 100U) &&
-        (imu_rx_restart_request == 0U))
-    {
-      /* Recover from silent UART4 DMA stalls with no HAL error callback. */
-      HAL_UART_DMAStop(&huart4);
-      imu_stall_restart_count++;
-      IMU_StartReceiveDMA();
-    }
 #if IRIDIUM_TEST_ENABLE
     if (uart7_rx_resp_ready != 0U)
     {
@@ -465,11 +508,6 @@ if ( timeout < 0 )
     }
 #endif
 
-    if (imu_nav_ready != 0U)
-    {
-      /* Avoid toggling shared control pins in fast IMU path. */
-      imu_nav_ready = 0U;
-    }
   }
   /* USER CODE END 3 */
 }
