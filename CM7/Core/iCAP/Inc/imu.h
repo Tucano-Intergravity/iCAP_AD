@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "stm32h7xx_hal.h"
 
 #define IMU_PACKET_SIZE       44U
 #define IMU_SYNC_BYTE         0x0EU
@@ -52,5 +53,10 @@ bool IMU_ParsePacket(const uint8_t *packet_data, IMU_Data_t *imu_data);
 bool IMU_IsValidMessageID(uint8_t msg_id);
 bool IMU_IsControlPacket(uint8_t msg_id);
 bool IMU_IsNavigationPacket(uint8_t msg_id);
+
+void IMU_Init(UART_HandleTypeDef *huart);
+bool IMU_PollNewData(IMU_Data_t *out_data);
+void IMU_HandleUartError(UART_HandleTypeDef *huart);
+void IMU_UART4_IdleIrqHandler(void);
 
 #endif /* IMU_H_ */

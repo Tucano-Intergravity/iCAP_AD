@@ -46,7 +46,6 @@
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 #define IRIDIUM_TEST_ENABLE 1
-#define IMU_DMA_BUFFER_SIZE 32768U
 
 /* USER CODE END PD */
 
@@ -73,26 +72,6 @@ static uint32_t uart7_last_tx_tick = 0U;
 static volatile uint8_t uart7_rx_restart_request = 0U;
 static volatile uint32_t uart7_rx_start_fail_count = 0U;
 static volatile uint32_t uart7_tx_fail_count = 0U;
-static uint8_t imu_dma_buffer[IMU_DMA_BUFFER_SIZE] __attribute__((aligned(32)));
-static uint16_t imu_dma_last_pos = 0U;
-static uint8_t imu_packet_buf[IMU_PACKET_SIZE];
-static volatile uint8_t imu_rx_restart_request = 0U;
-static volatile uint32_t imu_rx_start_fail_count = 0U;
-static volatile uint32_t imu_packet_count = 0U;
-static volatile uint32_t imu_packet_error_count = 0U;
-static IMU_Data_t imu_last_data;
-static volatile uint16_t imu_dma_current_pos_dbg = 0U;
-static volatile uint32_t imu_dma_bytes_total = 0U;
-static volatile uint32_t imu_dma_restart_count = 0U;
-static volatile uint32_t imu_uart4_error_count = 0U;
-static volatile uint32_t imu_uart4_last_error = 0U;
-static volatile uint32_t imu_last_rx_tick = 0U;
-static volatile uint32_t imu_uart4_idle_count = 0U;
-static volatile uint32_t imu_stall_restart_count = 0U;
-static volatile uint32_t imu_non_nav_header_count = 0U;
-static volatile uint32_t imu_last_progress_tick = 0U;
-static volatile uint16_t imu_dma_prev_pos_dbg = 0U;
-static volatile uint32_t imu_msg_id_ctrl_count = 0U;
 
 /* USER CODE END PV */
 
@@ -107,13 +86,6 @@ static void MX_UART4_Init(void);
 
 static void UART7_StartReceiveIT(void);
 static void UART7_SendAtCommandIT(void);
-static void IMU_Init(void);
-static bool IMU_PollNewData(IMU_Data_t *out_data);
-static void IMU_ResetPacketState(void);
-static void IMU_ProcessDmaBuffer(void);
-static void IMU_StartReceiveDMA(void);
-static void IMU_ServiceRecovery(void);
-static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length);
 
 /* USER CODE END PFP */
 
@@ -138,236 +110,6 @@ static void UART7_SendAtCommandIT(void)
   if ((tx_status != HAL_OK) && (tx_status != HAL_BUSY))
   {
     uart7_tx_fail_count++;
-  }
-}
-
-static void IMU_ResetPacketState(void)
-{
-  /* Reserved for future parser state reset. */
-}
-
-static bool IMU_PollNewData(IMU_Data_t *out_data)
-{
-  static uint32_t last_consumed_packet_count = 0U;
-  bool has_new_data = false;
-
-  /* Single IMU service entry point for main loop:
-   * 1) drain DMA buffer
-   * 2) recover stalled RX path
-   * 3) expose newly parsed NAV data */
-  IMU_ProcessDmaBuffer();
-  IMU_ServiceRecovery();
-
-  __disable_irq();
-  if (imu_packet_count != last_consumed_packet_count)
-  {
-    last_consumed_packet_count = imu_packet_count;
-    if (out_data != NULL)
-    {
-      *out_data = imu_last_data;
-    }
-    has_new_data = true;
-  }
-  __enable_irq();
-
-  return has_new_data;
-}
-
-static void IMU_Init(void)
-{
-  IMU_ResetPacketState();
-  imu_dma_last_pos = 0U;
-  imu_last_rx_tick = HAL_GetTick();
-  imu_last_progress_tick = imu_last_rx_tick;
-  imu_dma_prev_pos_dbg = 0U;
-  /* Match reference project behavior: keep overrun detection enabled. */
-  CLEAR_BIT(huart4.Instance->CR3, USART_CR3_OVRDIS);
-  IMU_StartReceiveDMA();
-}
-
-static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length)
-{
-#if defined (__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-  uintptr_t addr;
-  uintptr_t aligned_addr;
-  uintptr_t end_addr;
-  int32_t invalidate_len;
-
-  if ((length == 0U) || ((SCB->CCR & SCB_CCR_DC_Msk) == 0U))
-  {
-    return;
-  }
-
-  addr = (uintptr_t)&imu_dma_buffer[start];
-  aligned_addr = addr & ~(uintptr_t)31U;
-  end_addr = (addr + (uintptr_t)length + (uintptr_t)31U) & ~(uintptr_t)31U;
-  invalidate_len = (int32_t)(end_addr - aligned_addr);
-
-  SCB_InvalidateDCache_by_Addr((uint32_t *)aligned_addr, invalidate_len);
-#else
-  (void)start;
-  (void)length;
-#endif
-}
-
-static void IMU_ProcessDmaBuffer(void)
-{
-  uint16_t current_pos;
-  uint16_t available;
-  uint16_t pos;
-  uint16_t next_pos;
-  uint8_t msg_id;
-  uint16_t remaining;
-
-  if (huart4.hdmarx == NULL)
-  {
-    return;
-  }
-
-  /* Parse only from the main loop (not from UART/DMA ISRs) to avoid re-entrancy
-   * and missed work when a second IRQ returns early. Re-snapshot DMA position
-   * in an outer loop so bytes that arrive during parsing are still drained. */
-  for (;;)
-  {
-    current_pos = (uint16_t)(IMU_DMA_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(huart4.hdmarx));
-    imu_dma_current_pos_dbg = current_pos;
-    if (current_pos != imu_dma_prev_pos_dbg)
-    {
-      imu_dma_prev_pos_dbg = current_pos;
-      imu_last_progress_tick = HAL_GetTick();
-    }
-
-    if (current_pos >= imu_dma_last_pos)
-    {
-      available = (uint16_t)(current_pos - imu_dma_last_pos);
-      IMU_InvalidateDCacheRange(imu_dma_last_pos, available);
-    }
-    else
-    {
-      available = (uint16_t)((IMU_DMA_BUFFER_SIZE - imu_dma_last_pos) + current_pos);
-      IMU_InvalidateDCacheRange(imu_dma_last_pos, (uint16_t)(IMU_DMA_BUFFER_SIZE - imu_dma_last_pos));
-      IMU_InvalidateDCacheRange(0U, current_pos);
-    }
-
-    if (available == 0U)
-    {
-      return;
-    }
-
-    while (available >= IMU_PACKET_SIZE)
-    {
-      pos = imu_dma_last_pos;
-      next_pos = (uint16_t)((pos + 1U) % IMU_DMA_BUFFER_SIZE);
-      msg_id = imu_dma_buffer[next_pos];
-
-      if (imu_dma_buffer[pos] == IMU_SYNC_BYTE)
-      {
-        if (msg_id == IMU_MSG_ID_NAV)
-        {
-          for (uint16_t i = 0U; i < IMU_PACKET_SIZE; i++)
-          {
-            imu_packet_buf[i] = imu_dma_buffer[(pos + i) % IMU_DMA_BUFFER_SIZE];
-          }
-
-          if (IMU_ParsePacket(imu_packet_buf, &imu_last_data))
-          {
-            imu_last_data.timestamp = HAL_GetTick();
-            imu_packet_count++;
-            imu_last_rx_tick = HAL_GetTick();
-            imu_dma_bytes_total += IMU_PACKET_SIZE;
-            imu_dma_last_pos = (uint16_t)((pos + IMU_PACKET_SIZE) % IMU_DMA_BUFFER_SIZE);
-            available = (uint16_t)(available - IMU_PACKET_SIZE);
-            continue;
-          }
-
-          imu_packet_error_count++;
-        }
-        else
-        {
-          imu_non_nav_header_count++;
-          if (msg_id == IMU_MSG_ID_CTRL)
-          {
-            imu_msg_id_ctrl_count++;
-          }
-        }
-      }
-
-      /* Skip one byte and keep scanning for NAV header (0x0E 0xA2). */
-      imu_dma_bytes_total++;
-      imu_dma_last_pos = (uint16_t)((imu_dma_last_pos + 1U) % IMU_DMA_BUFFER_SIZE);
-      available--;
-    }
-
-    /* Optional: drop remaining non-header bytes without counting as packet errors. */
-    while (available > 0U)
-    {
-      if (imu_dma_buffer[imu_dma_last_pos] == IMU_SYNC_BYTE)
-      {
-        break;
-      }
-
-      imu_dma_bytes_total++;
-      imu_dma_last_pos = (uint16_t)((imu_dma_last_pos + 1U) % IMU_DMA_BUFFER_SIZE);
-      available--;
-    }
-
-    current_pos = (uint16_t)(IMU_DMA_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(huart4.hdmarx));
-    if (current_pos >= imu_dma_last_pos)
-    {
-      remaining = (uint16_t)(current_pos - imu_dma_last_pos);
-    }
-    else
-    {
-      remaining = (uint16_t)((IMU_DMA_BUFFER_SIZE - imu_dma_last_pos) + current_pos);
-    }
-
-    if (remaining < IMU_PACKET_SIZE)
-    {
-      return;
-    }
-  }
-}
-
-static void IMU_StartReceiveDMA(void)
-{
-  HAL_StatusTypeDef status;
-
-#ifdef UART_RXDATA_FLUSH_REQUEST
-  __HAL_UART_SEND_REQ(&huart4, UART_RXDATA_FLUSH_REQUEST);
-#endif
-  __HAL_UART_CLEAR_IDLEFLAG(&huart4);
-  status = HAL_UART_Receive_DMA(&huart4, imu_dma_buffer, IMU_DMA_BUFFER_SIZE);
-  if (status != HAL_OK)
-  {
-    imu_rx_start_fail_count++;
-    imu_rx_restart_request = 1U;
-  }
-  else
-  {
-    imu_dma_restart_count++;
-    imu_dma_prev_pos_dbg = 0U;
-    imu_last_progress_tick = HAL_GetTick();
-    __HAL_UART_CLEAR_IDLEFLAG(&huart4);
-    __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);
-  }
-}
-
-static void IMU_ServiceRecovery(void)
-{
-  if (imu_rx_restart_request != 0U)
-  {
-    imu_rx_restart_request = 0U;
-    IMU_StartReceiveDMA();
-  }
-
-  if ((huart4.hdmarx != NULL) &&
-      ((HAL_GetTick() - imu_last_progress_tick) > 100U) &&
-      (imu_rx_restart_request == 0U))
-  {
-    /* Recover from silent UART4 DMA stalls with no HAL error callback. */
-    HAL_UART_DMAStop(&huart4);
-    imu_stall_restart_count++;
-    IMU_StartReceiveDMA();
   }
 }
 
@@ -444,7 +186,7 @@ if ( timeout < 0 )
   MX_UART7_Init();
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
-  IMU_Init();
+  IMU_Init(&huart4);
 
   /* IRIDIUM 9603 power control: PF10 = HIGH */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
@@ -776,52 +518,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == UART4)
   {
-    HAL_StatusTypeDef restart_status;
-
-    imu_uart4_error_count++;
-    imu_uart4_last_error = huart->ErrorCode;
-    HAL_UART_DMAStop(&huart4);
-
-    /* Clear UART error flags (especially ORE) before restarting DMA RX */
-    if ((huart->ErrorCode & HAL_UART_ERROR_ORE) != 0U)
-    {
-      __HAL_UART_CLEAR_FLAG(&huart4, UART_CLEAR_OREF);
-    }
-    if ((huart->ErrorCode & HAL_UART_ERROR_NE) != 0U)
-    {
-      __HAL_UART_CLEAR_FLAG(&huart4, UART_CLEAR_NEF);
-    }
-    if ((huart->ErrorCode & HAL_UART_ERROR_FE) != 0U)
-    {
-      __HAL_UART_CLEAR_FLAG(&huart4, UART_CLEAR_FEF);
-    }
-    if ((huart->ErrorCode & HAL_UART_ERROR_PE) != 0U)
-    {
-      __HAL_UART_CLEAR_FLAG(&huart4, UART_CLEAR_PEF);
-    }
-
-#ifdef UART_RXDATA_FLUSH_REQUEST
-    __HAL_UART_SEND_REQ(&huart4, UART_RXDATA_FLUSH_REQUEST);
-#endif
-
-    IMU_ResetPacketState();
-    imu_dma_last_pos = 0U;
-    __HAL_UART_CLEAR_IDLEFLAG(&huart4);
-    restart_status = HAL_UART_Receive_DMA(&huart4, imu_dma_buffer, IMU_DMA_BUFFER_SIZE);
-    if (restart_status == HAL_OK)
-    {
-      imu_dma_restart_count++;
-      imu_rx_restart_request = 0U;
-      imu_dma_prev_pos_dbg = 0U;
-      imu_last_progress_tick = HAL_GetTick();
-      __HAL_UART_CLEAR_IDLEFLAG(&huart4);
-      __HAL_UART_ENABLE_IT(&huart4, UART_IT_IDLE);
-    }
-    else
-    {
-      imu_rx_restart_request = 1U;
-    }
-    imu_last_rx_tick = HAL_GetTick();
+    IMU_HandleUartError(huart);
     return;
   }
 
@@ -831,13 +528,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     memset(uart7_rx_buffer, 0, sizeof(uart7_rx_buffer));
     uart7_rx_restart_request = 1U;
   }
-}
-
-void IMU_UART4_IdleIrqHandler(void)
-{
-  __HAL_UART_CLEAR_IDLEFLAG(&huart4);
-  imu_uart4_idle_count++;
-  imu_last_rx_tick = HAL_GetTick();
 }
 
 /* USER CODE END 4 */
