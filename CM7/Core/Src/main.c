@@ -22,7 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "imu.h"
-#include <string.h>
+#include "iridium.h"
 
 /* USER CODE END Includes */
 
@@ -45,7 +45,6 @@
 #define HSEM_ID_0 (0U) /* HW semaphore 0*/
 #endif
 #endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
-#define IRIDIUM_TEST_ENABLE 1
 
 /* USER CODE END PD */
 
@@ -62,17 +61,6 @@ DMA_HandleTypeDef hdma_uart4_rx;
 
 /* USER CODE BEGIN PV */
 
-static uint8_t uart7_tx_cmd[] = "AT\r";
-static uint8_t uart7_rx_byte = 0;
-static uint8_t uart7_rx_buffer[128];
-static volatile uint16_t uart7_rx_index = 0;
-static volatile uint8_t uart7_rx_line_ready = 0;
-static volatile uint8_t uart7_rx_resp_ready = 0;
-static uint32_t uart7_last_tx_tick = 0U;
-static volatile uint8_t uart7_rx_restart_request = 0U;
-static volatile uint32_t uart7_rx_start_fail_count = 0U;
-static volatile uint32_t uart7_tx_fail_count = 0U;
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,34 +72,10 @@ static void MX_UART7_Init(void);
 static void MX_UART4_Init(void);
 /* USER CODE BEGIN PFP */
 
-static void UART7_StartReceiveIT(void);
-static void UART7_SendAtCommandIT(void);
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
-static void UART7_StartReceiveIT(void)
-{
-  HAL_StatusTypeDef rx_status = HAL_UART_Receive_IT(&huart7, &uart7_rx_byte, 1);
-
-  if ((rx_status != HAL_OK) && (rx_status != HAL_BUSY))
-  {
-    uart7_rx_start_fail_count++;
-    uart7_rx_restart_request = 1U;
-  }
-}
-
-static void UART7_SendAtCommandIT(void)
-{
-  HAL_StatusTypeDef tx_status = HAL_UART_Transmit_IT(&huart7, uart7_tx_cmd, sizeof(uart7_tx_cmd) - 1U);
-
-  if ((tx_status != HAL_OK) && (tx_status != HAL_BUSY))
-  {
-    uart7_tx_fail_count++;
-  }
-}
 
 /* USER CODE END 0 */
 
@@ -200,10 +164,7 @@ if ( timeout < 0 )
   HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, GPIO_PIN_SET);
   HAL_Delay(1000);
 
-#if IRIDIUM_TEST_ENABLE
-  UART7_StartReceiveIT();
-  UART7_SendAtCommandIT();
-#endif
+  Iridium_Init(&huart7);
 
   /* USER CODE END 2 */
 
@@ -212,6 +173,7 @@ if ( timeout < 0 )
   while (1)
   {
     IMU_Data_t imu_data;
+    const uint8_t *iridium_rx_data = NULL;
 
     /* USER CODE END WHILE */
 
@@ -222,33 +184,13 @@ if ( timeout < 0 )
       (void)imu_data;
     }
 
-#if IRIDIUM_TEST_ENABLE
-    if ((HAL_GetTick() - uart7_last_tx_tick) >= 1000U)
+    if (Iridium_PollNewData(&iridium_rx_data))
     {
-      uart7_last_tx_tick = HAL_GetTick();
-      __disable_irq();
-      uart7_rx_index = 0U;
-      memset(uart7_rx_buffer, 0, sizeof(uart7_rx_buffer));
-      uart7_rx_line_ready = 0U;
-      uart7_rx_resp_ready = 0U;
-      __enable_irq();
-      UART7_SendAtCommandIT();
+      uint16_t iridium_rx_len = Iridium_GetRxLength();
+      /* Inspect iridium_rx_data in debugger (example: "AT\r\r\nOK\r\n"). */
+      (void)iridium_rx_data;
+      (void)iridium_rx_len;
     }
-
-    if (uart7_rx_restart_request != 0U)
-    {
-      uart7_rx_restart_request = 0U;
-      UART7_StartReceiveIT();
-    }
-#endif
-
-#if IRIDIUM_TEST_ENABLE
-    if (uart7_rx_resp_ready != 0U)
-    {
-      uart7_rx_resp_ready = 0U;
-      /* Inspect uart7_rx_buffer in debugger (example: "AT\r\r\nOK\r\n"). */
-    }
-#endif
 
   }
   /* USER CODE END 3 */
@@ -478,30 +420,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == UART4)
   {
-    /* Parsing runs in the main loop (IMU_ProcessDmaBuffer). */
+    /* Parsing runs in the IMU module main-loop poll path. */
     return;
   }
 
   if (huart->Instance == UART7)
   {
-    if (uart7_rx_index < (sizeof(uart7_rx_buffer) - 1U))
-    {
-      uart7_rx_buffer[uart7_rx_index++] = uart7_rx_byte;
-      uart7_rx_buffer[uart7_rx_index] = '\0';
-    }
-
-    if (uart7_rx_byte == '\n')
-    {
-      uart7_rx_line_ready = 1U;
-    }
-
-    if ((strstr((char *)uart7_rx_buffer, "\r\nOK\r\n") != NULL) ||
-        (strstr((char *)uart7_rx_buffer, "\r\nERROR\r\n") != NULL))
-    {
-      uart7_rx_resp_ready = 1U;
-    }
-
-    UART7_StartReceiveIT();
+    Iridium_HandleRxCplt(huart);
   }
 }
 
@@ -509,7 +434,7 @@ void HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == UART4)
   {
-    /* Parsing runs in the main loop (IMU_ProcessDmaBuffer). */
+    /* Parsing runs in the IMU module main-loop poll path. */
     return;
   }
 }
@@ -524,9 +449,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 
   if (huart->Instance == UART7)
   {
-    uart7_rx_index = 0U;
-    memset(uart7_rx_buffer, 0, sizeof(uart7_rx_buffer));
-    uart7_rx_restart_request = 1U;
+    Iridium_HandleUartError(huart);
   }
 }
 
