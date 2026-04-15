@@ -13,6 +13,15 @@ static volatile uint8_t iridium_rx_restart_request = 0U;
 static volatile uint32_t iridium_rx_start_fail_count = 0U;
 static volatile uint32_t iridium_tx_fail_count = 0U;
 
+static void Iridium_ConfigureControlLines(void)
+{
+  /* IRIDIUM 9603 control lines */
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, GPIO_PIN_SET);
+  HAL_Delay(1000);
+}
+
 static void Iridium_StartReceiveIT(void)
 {
   HAL_StatusTypeDef rx_status;
@@ -49,6 +58,7 @@ static void Iridium_SendAtCommandIT(void)
 void Iridium_Init(UART_HandleTypeDef *huart)
 {
   s_iridium_uart = huart;
+  Iridium_ConfigureControlLines();
   iridium_rx_index = 0U;
   memset(iridium_rx_buffer, 0, sizeof(iridium_rx_buffer));
   iridium_rx_line_ready = 0U;

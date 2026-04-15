@@ -23,6 +23,9 @@
 /* USER CODE BEGIN Includes */
 #include "imu.h"
 #include "iridium.h"
+#include "gnss.h"
+#include "powercontrol.h"
+#include "ssr.h"
 
 /* USER CODE END Includes */
 
@@ -57,6 +60,7 @@
 
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart7;
+UART_HandleTypeDef huart8;
 DMA_HandleTypeDef hdma_uart4_rx;
 
 /* USER CODE BEGIN PV */
@@ -70,6 +74,7 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_UART7_Init(void);
 static void MX_UART4_Init(void);
+static void MX_UART8_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -149,22 +154,23 @@ if ( timeout < 0 )
   MX_DMA_Init();
   MX_UART7_Init();
   MX_UART4_Init();
+  MX_UART8_Init();
   /* USER CODE BEGIN 2 */
+  /* Power rails are controlled explicitly in main. */
+  PowerControl_SetGNSS(true);
+  PowerControl_SetIMU(true);
+  PowerControl_SetIridium(true);
+  HAL_Delay(1000);
+
   IMU_Init(&huart4);
 
-  /* IRIDIUM 9603 power control: PF10 = HIGH */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_1, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
-  HAL_Delay(1000);
-
-  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_9, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_10, GPIO_PIN_SET);
-  HAL_Delay(1000);
-
   Iridium_Init(&huart7);
+  GNSS_Init(&huart8);
+  SSR_Init();
+  (void)SSR_SetMode(SSR_CH0, SSR_MODE_BLINK_500MS);
+  (void)SSR_SetMode(SSR_CH1, SSR_MODE_BLINK_500MS);
+  (void)SSR_SetMode(SSR_CH2, SSR_MODE_BLINK_500MS);
+  (void)SSR_SetMode(SSR_CH3, SSR_MODE_BLINK_500MS);
 
   /* USER CODE END 2 */
 
@@ -174,6 +180,7 @@ if ( timeout < 0 )
   {
     IMU_Data_t imu_data;
     const uint8_t *iridium_rx_data = NULL;
+    GNSS_BestPosA_t gnss_bestposa;
 
     /* USER CODE END WHILE */
 
@@ -191,6 +198,16 @@ if ( timeout < 0 )
       (void)iridium_rx_data;
       (void)iridium_rx_len;
     }
+
+    uint8_t ii = 0;
+    if (GNSS_Process(&gnss_bestposa))
+    {
+      /* New BESTPOSA parsed data received: use gnss_bestposa here. */
+      (void)gnss_bestposa;
+      ii = 1;
+    }
+
+    SSR_Process();
 
   }
   /* USER CODE END 3 */
@@ -345,6 +362,54 @@ static void MX_UART7_Init(void)
 }
 
 /**
+  * @brief UART8 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_UART8_Init(void)
+{
+
+  /* USER CODE BEGIN UART8_Init 0 */
+
+  /* USER CODE END UART8_Init 0 */
+
+  /* USER CODE BEGIN UART8_Init 1 */
+
+  /* USER CODE END UART8_Init 1 */
+  huart8.Instance = UART8;
+  huart8.Init.BaudRate = 9600;
+  huart8.Init.WordLength = UART_WORDLENGTH_8B;
+  huart8.Init.StopBits = UART_STOPBITS_1;
+  huart8.Init.Parity = UART_PARITY_NONE;
+  huart8.Init.Mode = UART_MODE_TX_RX;
+  huart8.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart8.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart8.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart8.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart8, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart8, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN UART8_Init 2 */
+
+  /* USER CODE END UART8_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -376,12 +441,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8|GPIO_PIN_10, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PF8 PF10 */
   GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_10;
@@ -402,6 +472,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PD0 PD1 PD2 PD3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*AnalogSwitch Config */
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC2, SYSCFG_SWITCH_PC2_CLOSE);
@@ -427,6 +504,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   if (huart->Instance == UART7)
   {
     Iridium_HandleRxCplt(huart);
+    return;
+  }
+
+  if (huart->Instance == UART8)
+  {
+    GNSS_HandleRxCplt(huart);
   }
 }
 
@@ -450,6 +533,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   if (huart->Instance == UART7)
   {
     Iridium_HandleUartError(huart);
+    return;
+  }
+
+  if (huart->Instance == UART8)
+  {
+    GNSS_HandleUartError(huart);
   }
 }
 
