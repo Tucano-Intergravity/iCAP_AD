@@ -3,6 +3,10 @@
 #include <string.h>
 
 #define IMU_DMA_BUFFER_SIZE 32768U
+#define IMU_CTRL_PACKET_SIZE 20U
+#define IMU_FAIL_SNAPSHOT_COUNT 8U
+#define IMU_RX_BACKLOG_RESTART_THRESHOLD (IMU_DMA_BUFFER_SIZE - 128U)
+#define IMU_NAV_PARSE_GUARD_BYTES 2U
 
 static UART_HandleTypeDef *s_imu_uart = NULL;
 static uint8_t imu_dma_buffer[IMU_DMA_BUFFER_SIZE] __attribute__((aligned(32)));
@@ -25,16 +29,62 @@ static volatile uint32_t imu_non_nav_header_count = 0U;
 static volatile uint32_t imu_last_progress_tick = 0U;
 static volatile uint16_t imu_dma_prev_pos_dbg = 0U;
 static volatile uint32_t imu_msg_id_ctrl_count = 0U;
+static volatile uint32_t imu_nav_checksum_fail_count = 0U;
+static volatile uint32_t imu_nav_checksum_fail_write_idx = 0U;
+static uint8_t imu_nav_checksum_fail_samples[IMU_FAIL_SNAPSHOT_COUNT][IMU_PACKET_SIZE];
+static volatile uint16_t imu_nav_checksum_fail_calc[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint16_t imu_nav_checksum_fail_recv[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint16_t imu_nav_checksum_fail_pos[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint16_t imu_nav_checksum_fail_current_pos[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint16_t imu_nav_checksum_fail_available[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint8_t imu_nav_checksum_fail_wrapped[IMU_FAIL_SNAPSHOT_COUNT];
+static volatile uint32_t imu_backlog_restart_count = 0U;
 
 static void IMU_ResetPacketState(void);
 static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length);
 static void IMU_ProcessDmaBuffer(void);
 static void IMU_StartReceiveDMA(void);
 static void IMU_ServiceRecovery(void);
+static void IMU_RecordNavChecksumFailSample(const uint8_t *packet_data,
+                                            uint16_t pos,
+                                            uint16_t current_pos,
+                                            uint16_t available,
+                                            uint8_t wrapped);
 
 static void IMU_ResetPacketState(void)
 {
   (void)0;
+}
+
+static void IMU_RecordNavChecksumFailSample(const uint8_t *packet_data,
+                                            uint16_t pos,
+                                            uint16_t current_pos,
+                                            uint16_t available,
+                                            uint8_t wrapped)
+{
+  uint32_t slot;
+  uint16_t calc_checksum;
+  uint16_t recv_checksum;
+
+  if (packet_data == NULL)
+  {
+    return;
+  }
+
+  calc_checksum = IMU_CalculateChecksum(packet_data, IMU_PACKET_SIZE);
+  recv_checksum = (uint16_t)packet_data[IMU_PACKET_SIZE - 2U] |
+                  ((uint16_t)packet_data[IMU_PACKET_SIZE - 1U] << 8);
+
+  slot = imu_nav_checksum_fail_write_idx % IMU_FAIL_SNAPSHOT_COUNT;
+  memcpy(imu_nav_checksum_fail_samples[slot], packet_data, IMU_PACKET_SIZE);
+  imu_nav_checksum_fail_calc[slot] = calc_checksum;
+  imu_nav_checksum_fail_recv[slot] = recv_checksum;
+  imu_nav_checksum_fail_pos[slot] = pos;
+  imu_nav_checksum_fail_current_pos[slot] = current_pos;
+  imu_nav_checksum_fail_available[slot] = available;
+  imu_nav_checksum_fail_wrapped[slot] = wrapped;
+  imu_nav_checksum_fail_write_idx++;
+  imu_nav_checksum_fail_count++;
 }
 
 static void IMU_InvalidateDCacheRange(uint16_t start, uint16_t length)
@@ -70,6 +120,11 @@ static void IMU_ProcessDmaBuffer(void)
   uint16_t next_pos;
   uint8_t msg_id;
   uint16_t remaining;
+  uint16_t advance;
+  uint16_t scan_offset;
+  uint16_t scan_pos;
+  uint16_t scan_next_pos;
+  uint8_t found_nav_header;
 
   if ((s_imu_uart == NULL) || (s_imu_uart->hdmarx == NULL))
   {
@@ -98,6 +153,14 @@ static void IMU_ProcessDmaBuffer(void)
       IMU_InvalidateDCacheRange(0U, current_pos);
     }
 
+    if (available >= IMU_RX_BACKLOG_RESTART_THRESHOLD)
+    {
+      HAL_UART_DMAStop(s_imu_uart);
+      imu_backlog_restart_count++;
+      IMU_StartReceiveDMA();
+      return;
+    }
+
     if (available == 0U)
     {
       return;
@@ -113,6 +176,20 @@ static void IMU_ProcessDmaBuffer(void)
       {
         if (msg_id == IMU_MSG_ID_NAV)
         {
+          if (available < (IMU_PACKET_SIZE + IMU_NAV_PARSE_GUARD_BYTES))
+          {
+            return;
+          }
+
+          if (imu_dma_buffer[(pos + IMU_PACKET_SIZE) % IMU_DMA_BUFFER_SIZE] != IMU_SYNC_BYTE)
+          {
+            imu_non_nav_header_count++;
+            imu_dma_bytes_total++;
+            imu_dma_last_pos = (uint16_t)((imu_dma_last_pos + 1U) % IMU_DMA_BUFFER_SIZE);
+            available--;
+            continue;
+          }
+
           for (uint16_t i = 0U; i < IMU_PACKET_SIZE; i++)
           {
             imu_packet_buf[i] = imu_dma_buffer[(pos + i) % IMU_DMA_BUFFER_SIZE];
@@ -129,21 +206,62 @@ static void IMU_ProcessDmaBuffer(void)
             continue;
           }
 
+          IMU_RecordNavChecksumFailSample(imu_packet_buf,
+                                          pos,
+                                          current_pos,
+                                          available,
+                                          (current_pos < pos) ? 1U : 0U);
           imu_packet_error_count++;
+        }
+        else if (msg_id == IMU_MSG_ID_CTRL)
+        {
+          if (available >= IMU_CTRL_PACKET_SIZE)
+          {
+            imu_non_nav_header_count++;
+            imu_msg_id_ctrl_count++;
+            imu_dma_bytes_total += IMU_CTRL_PACKET_SIZE;
+            imu_dma_last_pos = (uint16_t)((pos + IMU_CTRL_PACKET_SIZE) % IMU_DMA_BUFFER_SIZE);
+            available = (uint16_t)(available - IMU_CTRL_PACKET_SIZE);
+            continue;
+          }
+
+          imu_non_nav_header_count++;
+          imu_msg_id_ctrl_count++;
         }
         else
         {
           imu_non_nav_header_count++;
-          if (msg_id == IMU_MSG_ID_CTRL)
-          {
-            imu_msg_id_ctrl_count++;
-          }
         }
       }
 
-      imu_dma_bytes_total++;
-      imu_dma_last_pos = (uint16_t)((imu_dma_last_pos + 1U) % IMU_DMA_BUFFER_SIZE);
-      available--;
+      advance = 0U;
+      found_nav_header = 0U;
+      for (scan_offset = 1U; (scan_offset + 1U) < available; scan_offset++)
+      {
+        scan_pos = (uint16_t)((pos + scan_offset) % IMU_DMA_BUFFER_SIZE);
+        scan_next_pos = (uint16_t)((scan_pos + 1U) % IMU_DMA_BUFFER_SIZE);
+        if ((imu_dma_buffer[scan_pos] == IMU_SYNC_BYTE) &&
+            (imu_dma_buffer[scan_next_pos] == IMU_MSG_ID_NAV))
+        {
+          advance = scan_offset;
+          found_nav_header = 1U;
+          break;
+        }
+      }
+
+      if (found_nav_header == 0U)
+      {
+        advance = (uint16_t)(available - 1U);
+      }
+
+      if (advance == 0U)
+      {
+        break;
+      }
+
+      imu_dma_bytes_total += advance;
+      imu_dma_last_pos = (uint16_t)((imu_dma_last_pos + advance) % IMU_DMA_BUFFER_SIZE);
+      available = (uint16_t)(available - advance);
     }
 
     while (available > 0U)
@@ -227,12 +345,12 @@ uint16_t IMU_CalculateChecksum(const uint8_t *data, uint16_t length)
 {
   uint16_t sum = 0U;
 
-  if ((data == NULL) || (length < IMU_PACKET_SIZE))
+  if ((data == NULL) || (length < 4U) || ((length & 1U) != 0U))
   {
     return 0U;
   }
 
-  for (uint16_t i = 0U; i < (IMU_PACKET_SIZE - 2U); i += 2U)
+  for (uint16_t i = 0U; i < (length - 2U); i += 2U)
   {
     uint16_t word = (uint16_t)data[i] | ((uint16_t)data[i + 1U] << 8);
     sum = (uint16_t)(sum + word);

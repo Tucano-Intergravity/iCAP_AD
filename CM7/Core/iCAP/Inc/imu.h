@@ -21,6 +21,7 @@ typedef struct {
     int16_t linear_accel_y;
     int16_t linear_accel_z;
     uint16_t status_word;
+    uint16_t multiplexed_status_word2;
     int32_t delta_angle_x;
     int32_t delta_angle_y;
     int32_t delta_angle_z;
@@ -30,6 +31,8 @@ typedef struct {
     uint16_t checksum;
 } imu_raw_packet_t;
 #pragma pack(pop)
+
+_Static_assert(sizeof(imu_raw_packet_t) == IMU_PACKET_SIZE, "imu_raw_packet_t must match NAV packet size");
 
 typedef struct {
     float angular_rate_x;
